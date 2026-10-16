@@ -1,0 +1,275 @@
+rules_version = '2';
+
+// Model danych:
+//   users/{uid}                          profil (nazwa, e-mail), lastSeen {teamId: czas}
+//   presence/{uid}                       online, lastActive - kto ma otwartą aplikację
+//   invites/{kod}                        teamId, teamName, createdBy, createdAt, expiresAt
+//   teams/{teamId}                       name, ownerId, personal, roles {uid: rola},
+//                                        memberIds [uid], memberNames {uid: imię}, createdAt
+//     joins/{uid}                        kod, którym ktoś dołączył (do sprawdzenia w regułach)
+//     songs/{songId}                     title, author, lyrics, updatedAt, updatedBy
+//       revisions/{revisionId}           poprzednie wersje piosenki
+//     playlists/{playlistId}             name, date, songIds, createdBy, createdAt, updatedAt
+//       comments/{commentId}             text, authorId, authorName, createdAt
+//     messages/{messageId}               text, authorId, authorName, createdAt, type,
+//                                        authorForm?, subject?, playlistId?, songId?, count?
+//
+// "Mój śpiewnik" to zespół z personal == true i id "personal_<uid>".
+// Role: owner (wszystko), editor (piosenki i playlisty), member (tylko odczyt + czat).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function validName(name, maxLength) {
+      return name is string && name.size() > 0 && name.size() <= maxLength;
+    }
+
+    match /users/{userId} {
+      allow read, write: if signedIn() && uid() == userId;
+    }
+
+    // Kod zaproszenia to id dokumentu. Kody są losowe i nie da się ich wylistować,
+    // więc odczytać zaproszenie może tylko ktoś, kto dostał kod.
+    // Status "w aplikacji": każdy zapisuje tylko swój, czytać mogą zalogowani
+    // (uid zna się tylko z listy członków wspólnego zespołu).
+    match /presence/{userId} {
+      allow read: if signedIn();
+      allow write: if signedIn() && userId == uid()
+        && request.resource.data.keys().hasOnly(['online', 'lastActive'])
+        && request.resource.data.online is bool
+        && request.resource.data.lastActive == request.time;
+    }
+
+    match /invites/{code} {
+      // Zapraszać mogą właściciel i edytorzy.
+      function canInvite(teamId) {
+        return get(/databases/$(database)/documents/teams/$(teamId)).data.roles.get(uid(), null) in ['owner', 'editor'];
+      }
+
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['teamId', 'teamName', 'createdBy', 'createdAt', 'expiresAt'])
+        && canInvite(request.resource.data.teamId)
+        && validName(request.resource.data.teamName, 80)
+        && request.resource.data.createdBy == uid()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt <= request.time + duration.value(30, 'd');
+      allow delete: if signedIn() && canInvite(resource.data.teamId);
+    }
+
+    match /teams/{teamId} {
+      function teamData() {
+        return get(/databases/$(database)/documents/teams/$(teamId)).data;
+      }
+
+      function role() {
+        return teamData().roles.get(uid(), null);
+      }
+
+      function isMember() {
+        return signedIn() && role() != null;
+      }
+
+      function canEdit() {
+        return signedIn() && role() in ['owner', 'editor'];
+      }
+
+      // Zmieniono tylko wpis zalogowanej osoby w mapie (albo mapy nie ma wcale).
+      function onlyOwnNameChanged() {
+        return request.resource.data.get('memberNames', {})
+          .diff(resource.data.get('memberNames', {}))
+          .affectedKeys().hasOnly([uid()]);
+      }
+
+      function validNewTeam() {
+        let t = request.resource.data;
+        return t.keys().hasOnly(['name', 'ownerId', 'personal', 'roles', 'memberIds', 'memberNames', 'createdAt'])
+          && validName(t.name, 80)
+          && t.ownerId == uid()
+          && t.memberIds == [uid()]
+          && t.roles.keys().hasOnly([uid()])
+          && t.roles[uid()] == 'owner'
+          && t.get('memberNames', {}).keys().hasOnly([uid()])
+          && t.createdAt == request.time
+          // Prywatny śpiewnik może mieć tylko id "personal_<swoje uid>".
+          && (t.personal == false || (t.personal == true && teamId == 'personal_' + uid()));
+      }
+
+      // Dołączanie: w tej samej operacji (batch) zapisuje się joins/{uid} z kodem,
+      // a reguła sprawdza, że kod prowadzi do tego zespołu i nie wygasł.
+      function isJoining() {
+        let code = getAfter(/databases/$(database)/documents/teams/$(teamId)/joins/$(uid())).data.code;
+        let invite = get(/databases/$(database)/documents/invites/$(code)).data;
+        let t = request.resource.data;
+        return !(uid() in resource.data.memberIds)
+          && resource.data.personal == false
+          && invite.teamId == teamId
+          && invite.expiresAt > request.time
+          && t.diff(resource.data).affectedKeys().hasOnly(['roles', 'memberIds', 'memberNames'])
+          && t.memberIds == resource.data.memberIds.concat([uid()])
+          && t.roles.diff(resource.data.roles).affectedKeys().hasOnly([uid()])
+          && t.roles[uid()] == 'editor'
+          && onlyOwnNameChanged();
+      }
+
+      // Opuszczanie zespołu przez kogoś, kto nie jest właścicielem.
+      function isLeaving() {
+        let t = request.resource.data;
+        return resource.data.roles.get(uid(), null) in ['editor', 'member']
+          && t.diff(resource.data).affectedKeys().hasOnly(['roles', 'memberIds', 'memberNames'])
+          && t.memberIds == resource.data.memberIds.removeAll([uid()])
+          && !(uid() in t.roles)
+          && t.roles.diff(resource.data.roles).affectedKeys().hasOnly([uid()])
+          && onlyOwnNameChanged();
+      }
+
+      // Właściciel: nazwa, role i usuwanie członków. Nie może nikogo dopisać
+      // (do tego są zaproszenia) ani odebrać sobie roli właściciela.
+      function isOwnerUpdate() {
+        let t = request.resource.data;
+        return resource.data.roles.get(uid(), null) == 'owner'
+          && t.diff(resource.data).affectedKeys().hasOnly(['name', 'roles', 'memberIds', 'memberNames'])
+          && validName(t.name, 80)
+          && t.roles[uid()] == 'owner'
+          && t.roles.values().hasOnly(['owner', 'editor', 'member'])
+          && resource.data.roles.keys().hasAll(t.roles.keys())
+          && resource.data.memberIds.hasAll(t.memberIds)
+          && t.memberIds.hasAll(t.roles.keys())
+          && t.roles.keys().hasAll(t.memberIds);
+      }
+
+      // Edytor może zmienić nazwę zespołu (właściciel - w isOwnerUpdate).
+      function isEditorRename() {
+        return resource.data.roles.get(uid(), null) == 'editor'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+          && validName(request.resource.data.name, 80);
+      }
+
+      // Członek może ustawić swoje imię widoczne w zespole.
+      function isNameUpdate() {
+        return uid() in resource.data.memberIds
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberNames'])
+          && onlyOwnNameChanged()
+          && validName(request.resource.data.memberNames[uid()], 80);
+      }
+
+      // Nieistniejący dokument wolno sprawdzić tylko dla własnego prywatnego śpiewnika
+      // (aplikacja robi to przy pierwszym logowaniu, zanim go utworzy).
+      allow get: if signedIn()
+        && (resource == null
+          ? teamId == 'personal_' + uid()
+          : uid() in resource.data.memberIds);
+      allow list: if signedIn() && uid() in resource.data.memberIds;
+
+      allow create: if signedIn() && validNewTeam();
+      allow update: if signedIn()
+        && (isOwnerUpdate() || isEditorRename() || isJoining() || isLeaving() || isNameUpdate());
+      allow delete: if signedIn()
+        && resource.data.roles.get(uid(), null) == 'owner'
+        && resource.data.personal == false;
+
+      match /joins/{userId} {
+        allow read: if isMember();
+        allow create, update: if signedIn() && userId == uid()
+          && request.resource.data.keys().hasOnly(['code', 'joinedAt'])
+          && request.resource.data.joinedAt == request.time
+          && get(/databases/$(database)/documents/invites/$(request.resource.data.code)).data.teamId == teamId;
+      }
+
+      match /songs/{songId} {
+        function validSong() {
+          let s = request.resource.data;
+          return s.keys().hasOnly(['title', 'author', 'lyrics', 'updatedAt', 'updatedBy'])
+            && validName(s.title, 200)
+            && s.author is string && s.author.size() <= 200
+            && s.lyrics is string && s.lyrics.size() <= 50000
+            && s.updatedAt == request.time
+            && s.updatedBy == uid();
+        }
+
+        allow read: if isMember();
+        allow create, update: if canEdit() && validSong();
+        allow delete: if canEdit();
+
+        match /revisions/{revisionId} {
+          allow read: if isMember();
+          // Historia tylko się dopisuje - nie da się jej zmienić ani usunąć.
+          allow create: if canEdit();
+        }
+
+        // Komentarze może pisać każdy członek (także "tylko odczyt").
+        match /comments/{commentId} {
+          allow read: if isMember();
+          allow create: if isMember()
+            && request.resource.data.keys().hasOnly(['text', 'authorId', 'authorName', 'createdAt'])
+            && validName(request.resource.data.text, 1000)
+            && request.resource.data.authorId == uid()
+            && request.resource.data.authorName is string
+            && request.resource.data.authorName.size() <= 80
+            && request.resource.data.createdAt == request.time;
+          allow delete: if isMember() && resource.data.authorId == uid();
+        }
+      }
+
+      match /playlists/{playlistId} {
+        function validPlaylist() {
+          let p = request.resource.data;
+          return p.keys().hasOnly(['name', 'date', 'songIds', 'createdBy', 'createdAt', 'updatedAt'])
+            && validName(p.name, 100)
+            && (p.get('date', null) == null || p.date is timestamp)
+            && p.songIds is list && p.songIds.size() <= 300
+            && p.updatedAt == request.time;
+        }
+
+        allow read: if isMember();
+        allow create: if canEdit() && validPlaylist()
+          && request.resource.data.createdBy == uid()
+          && request.resource.data.createdAt == request.time;
+        allow update: if canEdit() && validPlaylist()
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.createdAt == resource.data.createdAt;
+        allow delete: if canEdit();
+      }
+
+      match /messages/{messageId} {
+        // type: zwykła wiadomość albo zdarzenie (udostępniona setlista,
+        // nowa/zmieniona piosenka, import, komentarz) z odnośnikiem.
+        function validMessage() {
+          let m = request.resource.data;
+          return m.keys().hasOnly(['text', 'authorId', 'authorName', 'createdAt', 'type', 'authorForm', 'subject', 'playlistId', 'songId', 'count'])
+            && validName(m.text, 2000)
+            && m.authorId == uid()
+            && m.authorName is string && m.authorName.size() <= 80
+            && m.createdAt == request.time
+            && m.get('type', 'text') in ['text', 'setlist', 'song_added', 'song_updated', 'songs_imported', 'comment', 'joined', 'left', 'team_created', 'team_renamed']
+            && m.get('authorForm', 'n') in ['m', 'f', 'n']
+            && (m.get('subject', null) == null || (m.subject is string && m.subject.size() <= 300))
+            && (m.get('playlistId', null) == null || m.playlistId is string)
+            && (m.get('songId', null) == null || m.songId is string)
+            && (m.get('count', null) == null || m.count is int);
+        }
+
+        // Członek po zakończeniu operacji - wiadomość "dołączył do zespołu"
+        // i "utworzył zespół" zapisują się razem z dołączeniem/utworzeniem.
+        function isMemberAfter() {
+          return signedIn()
+            && getAfter(/databases/$(database)/documents/teams/$(teamId)).data.roles.get(uid(), null) != null;
+        }
+
+        allow read: if isMember();
+        // Czat jest dla wszystkich członków, także tych z rolą "member".
+        allow create: if isMemberAfter() && validMessage();
+        allow delete: if isMember() && resource.data.authorId == uid();
+      }
+    }
+  }
+}

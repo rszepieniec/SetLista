@@ -1,0 +1,24 @@
+{
+  // Run and Debug (Cmd+Shift+D) -> wybierz konfigurację -> F5.
+  // Logi [firebase] pojawiają się w zakładce DEBUG CONSOLE (Cmd+Shift+Y).
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "SetLista (prawdziwy Firebase)",
+      "request": "launch",
+      "type": "dart"
+    },
+    {
+      "name": "SetLista (emulator)",
+      "request": "launch",
+      "type": "dart",
+      "args": ["--dart-define=USE_EMULATOR=true"]
+    },
+    {
+      "name": "SetLista (szczegółowe logi Firestore)",
+      "request": "launch",
+      "type": "dart",
+      "args": ["--dart-define=FIREBASE_VERBOSE=true"]
+    }
+  ]
+}

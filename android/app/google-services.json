@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "575789125024",
+    "project_id": "setlista-app",
+    "storage_bucket": "setlista-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:575789125024:android:d0a564edf5dcba30d868c5",
+        "android_client_info": {
+          "package_name": "pl.setlista.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyChEwkaM38ZdW7_2OJ96pafclsxnb1Hyr4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
